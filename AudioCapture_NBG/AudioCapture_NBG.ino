@@ -19,20 +19,24 @@
 #define I2S_READ_LEN (1024)
 
 // MFCC Configuration - Matching librosa parameters
-// librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13, n_fft=10000, hop_length=7200)
-#define N_FFT 10000                    // n_fft parameter (what librosa uses)
-#define HOP_LENGTH 5000                // hop_length parameter
-#define FRAME_SIZE N_FFT               // Window size = n_fft (librosa default)
-#define FRAME_STRIDE HOP_LENGTH        // Stride = hop_length
-#define FFT_SIZE 4096                  // ESP-DSP max supported size
+// librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13, n_fft=4096, hop_length=512)
+// Note: hop_length=512 is intentionally smaller than the librosa default (n_fft/4=1024)
+//       to achieve finer temporal resolution for classification.
+#define N_FFT 4096                     // n_fft parameter (what librosa uses)
+#define HOP_LENGTH 512                 // hop_length parameter
+#define FFT_SIZE 4096                  // ESP-DSP max supported size (equals N_FFT)
 #define NUM_MFCC 13
 #define NUM_MEL_FILTERS 128            // librosa default
 #define MEL_LOW_FREQ 0                 // librosa default
 #define MEL_HIGH_FREQ (SAMPLE_RATE / 2)
 
-// Derived timing values
-#define FRAME_SIZE_MS ((FRAME_SIZE * 1000) / SAMPLE_RATE)      // ~625ms
-#define FRAME_STRIDE_MS ((FRAME_STRIDE * 1000) / SAMPLE_RATE)  // 450ms
+// Audio buffer management - decoupled from MFCC parameters
+// Buffer holds N_FFT samples for the current frame plus HOP_LENGTH for the next hop
+#define AUDIO_BUFFER_SIZE (N_FFT + HOP_LENGTH)
+
+// Derived timing values (for display/metadata only, not buffer control)
+#define FRAME_SIZE_MS ((N_FFT * 1000) / SAMPLE_RATE)      // ~256ms
+#define FRAME_STRIDE_MS ((HOP_LENGTH * 1000) / SAMPLE_RATE)  // 32ms
 
 // Classifier Configuration
 #define NUM_CLASSES 5  // Change this to match your number of classes
@@ -137,13 +141,13 @@ struct WAVHeader {
 bool allocateBuffers() {
   Serial.println("Allocating buffers in PSRAM...");
   
-  // Allocate audio buffer (need space for frame + overlap)
-  audioBuffer = (int16_t*)ps_malloc((FRAME_SIZE + FRAME_STRIDE) * sizeof(int16_t));
+  // Allocate audio buffer sized for sliding window (N_FFT + HOP_LENGTH samples)
+  audioBuffer = (int16_t*)ps_malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t));
   if (!audioBuffer) {
     Serial.println("Failed to allocate audioBuffer");
     return false;
   }
-  memset(audioBuffer, 0, (FRAME_SIZE + FRAME_STRIDE) * sizeof(int16_t));
+  memset(audioBuffer, 0, AUDIO_BUFFER_SIZE * sizeof(int16_t));
   
   // Allocate FFT buffers
   fft_input = (float*)ps_malloc(FFT_SIZE * 2 * sizeof(float));
@@ -354,11 +358,11 @@ void classifyStoredMFCC() {
   f.read((uint8_t*)&sampleRate, sizeof(uint32_t));
   
   Serial.println("\n=== Classifying Stored MFCC Features ===");
-  Serial.print("Frame Size: "); Serial.print(FRAME_SIZE); Serial.print(" samples ("); 
+  Serial.print("Frame Size: "); Serial.print(N_FFT); Serial.print(" samples ("); 
   Serial.print(frameSizeMs); Serial.println(" ms)");
-  Serial.print("Hop Length: "); Serial.print(FRAME_STRIDE); Serial.print(" samples (");
+  Serial.print("Hop Length: "); Serial.print(HOP_LENGTH); Serial.print(" samples (");
   Serial.print(frameStrideMs); Serial.println(" ms)");
-  Serial.print("Frame Overlap: "); Serial.print(FRAME_SIZE - FRAME_STRIDE); Serial.println(" samples");
+  Serial.print("Frame Overlap: "); Serial.print(N_FFT - HOP_LENGTH); Serial.println(" samples");
   Serial.println();
   
   // Accumulate all MFCC frames
@@ -677,18 +681,17 @@ void dumpMfccFile() {
   
   Serial.println("\n=== MFCC FILE DUMP ===");
   Serial.print("Num Coefficients: "); Serial.println(numCoeffs);
-  Serial.print("Frame Size: "); Serial.print(FRAME_SIZE); Serial.print(" samples (");
+  Serial.print("Frame Size: "); Serial.print(N_FFT); Serial.print(" samples (");
   Serial.print(frameSizeMs); Serial.println(" ms)");
-  Serial.print("Hop Length: "); Serial.print(FRAME_STRIDE); Serial.print(" samples (");
+  Serial.print("Hop Length: "); Serial.print(HOP_LENGTH); Serial.print(" samples (");
   Serial.print(frameStrideMs); Serial.println(" ms)");
   Serial.print("Sample Rate: "); Serial.println(sampleRate);
   Serial.println("\nLibrosa-compatible parameters:");
   Serial.print("  n_mfcc: "); Serial.println(NUM_MFCC);
-  Serial.print("  n_fft (requested): "); Serial.println(N_FFT);
-  Serial.print("  FFT size (actual): "); Serial.println(FFT_SIZE);
+  Serial.print("  n_fft: "); Serial.println(N_FFT);
+  Serial.print("  FFT size: "); Serial.println(FFT_SIZE);
   Serial.print("  hop_length: "); Serial.println(HOP_LENGTH);
   Serial.print("  n_mels: "); Serial.println(NUM_MEL_FILTERS);
-  Serial.println("  Note: Using first 4096 samples due to ESP-DSP limitation");
   Serial.println("\nMFCC Coefficients (frame by frame):");
   
   // Accumulator to calculate mean while reading
@@ -744,14 +747,12 @@ void setup() {
   
   Serial.println("ESP32-S3 INMP441 Recorder with MFCC and Classifier");
   Serial.println("===================================================");
-  Serial.println("Librosa-approximated MFCC extraction:");
+  Serial.println("Librosa-compatible MFCC extraction:");
   Serial.print("  n_mfcc="); Serial.println(NUM_MFCC);
-  Serial.print("  n_fft (requested)="); Serial.println(N_FFT);
-  Serial.print("  FFT size (actual)="); Serial.println(FFT_SIZE);
+  Serial.print("  n_fft="); Serial.println(N_FFT);
+  Serial.print("  FFT size="); Serial.println(FFT_SIZE);
   Serial.print("  hop_length="); Serial.println(HOP_LENGTH);
   Serial.print("  n_mels="); Serial.println(NUM_MEL_FILTERS);
-  Serial.println("  * Note: ESP-DSP limited to 4096 FFT size");
-  Serial.println("  * Using first 4096 of 10000 samples");
   Serial.println("Classification method: Mean of all MFCC frames");
   
   // Check PSRAM
@@ -771,11 +772,11 @@ void setup() {
     while(1) delay(1000);
   }
   
-  Serial.print("Frame size: "); Serial.print(FRAME_SIZE); 
+  Serial.print("Frame size (n_fft): "); Serial.print(N_FFT); 
   Serial.print(" samples (~"); Serial.print(FRAME_SIZE_MS); Serial.println(" ms)");
-  Serial.print("Hop length: "); Serial.print(FRAME_STRIDE); 
+  Serial.print("Hop length: "); Serial.print(HOP_LENGTH); 
   Serial.print(" samples ("); Serial.print(FRAME_STRIDE_MS); Serial.println(" ms)");
-  Serial.print("Overlap: "); Serial.print(FRAME_SIZE - FRAME_STRIDE); Serial.println(" samples");
+  Serial.print("Overlap: "); Serial.print(N_FFT - HOP_LENGTH); Serial.println(" samples");
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   
@@ -925,14 +926,13 @@ void startRecording() {
   recordedSamples = 0;
   mfccFrameCount = 0;
   bufferIndex = 0;
-  memset(audioBuffer, 0, (FRAME_SIZE + FRAME_STRIDE) * sizeof(int16_t));
+  memset(audioBuffer, 0, AUDIO_BUFFER_SIZE * sizeof(int16_t));
   
   // Reset MFCC accumulator for this recording
   mfccAccumulator.reset();
   
   isRecording = true;
   Serial.println("Recording started");
-  Serial.println("(Using 4096-point FFT approximation of 10000-point)");
 }
 
 void stopRecording() {
@@ -1024,12 +1024,14 @@ void recordAudio() {
       audioBuffer[bufferIndex] = sample;
       bufferIndex++;
       
-      if (bufferIndex >= FRAME_SIZE) {
+      // Extract an MFCC frame every HOP_LENGTH samples once the buffer holds N_FFT samples
+      if (bufferIndex >= N_FFT) {
         extractMFCC(audioBuffer);
         
-        memmove(audioBuffer, audioBuffer + FRAME_STRIDE, 
-                (FRAME_SIZE - FRAME_STRIDE) * sizeof(int16_t));
-        bufferIndex = FRAME_SIZE - FRAME_STRIDE;
+        // Slide the buffer forward by HOP_LENGTH, keeping the overlap region
+        memmove(audioBuffer, audioBuffer + HOP_LENGTH, 
+                (N_FFT - HOP_LENGTH) * sizeof(int16_t));
+        bufferIndex = N_FFT - HOP_LENGTH;
       }
     }
   }
