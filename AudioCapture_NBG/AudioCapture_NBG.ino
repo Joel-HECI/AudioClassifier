@@ -18,20 +18,25 @@
 #define BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
 #define I2S_READ_LEN (1024)
 
-// MFCC Configuration
-#define FRAME_SIZE_MS 25
-#define FRAME_STRIDE_MS 10
-#define FRAME_SIZE (SAMPLE_RATE * FRAME_SIZE_MS / 1000)  // 400 samples
-#define FRAME_STRIDE (SAMPLE_RATE * FRAME_STRIDE_MS / 1000)  // 160 samples
-#define FFT_SIZE 512  // Next power of 2 >= FRAME_SIZE
+// MFCC Configuration - Matching librosa parameters
+// librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=13, n_fft=10000, hop_length=7200)
+#define N_FFT 10000                    // n_fft parameter (what librosa uses)
+#define HOP_LENGTH 5000                // hop_length parameter
+#define FRAME_SIZE N_FFT               // Window size = n_fft (librosa default)
+#define FRAME_STRIDE HOP_LENGTH        // Stride = hop_length
+#define FFT_SIZE 4096                  // ESP-DSP max supported size
 #define NUM_MFCC 13
-#define NUM_MEL_FILTERS 26
-#define MEL_LOW_FREQ 0
+#define NUM_MEL_FILTERS 128            // librosa default
+#define MEL_LOW_FREQ 0                 // librosa default
 #define MEL_HIGH_FREQ (SAMPLE_RATE / 2)
 
+// Derived timing values
+#define FRAME_SIZE_MS ((FRAME_SIZE * 1000) / SAMPLE_RATE)      // ~625ms
+#define FRAME_STRIDE_MS ((FRAME_STRIDE * 1000) / SAMPLE_RATE)  // 450ms
+
 // Classifier Configuration
-#define NUM_CLASSES 4  // Change this to match your number of classes
-#define ENABLE_REALTIME_CLASSIFICATION true  // Set to true to classify during recording
+#define NUM_CLASSES 5  // Change this to match your number of classes
+#define ENABLE_REALTIME_CLASSIFICATION false  // Set to true to classify during recording
 
 // WAV file configuration
 #define WAV_FILE_PATH "/recording.wav"
@@ -47,19 +52,52 @@ File mfccFile;
 uint32_t recordedSamples = 0;
 uint32_t mfccFrameCount = 0;
 
-// MFCC buffers
-int16_t audioBuffer[FRAME_SIZE + FRAME_STRIDE];  // Sliding window buffer
-int16_t* frameBuffer = audioBuffer;  // Points to current frame
+// MFCC buffers - moved to PSRAM using pointers
+int16_t* audioBuffer = nullptr;  // Will allocate in PSRAM
 uint32_t bufferIndex = 0;
 
-// FFT buffers (ESP-DSP requires 2*N for complex FFT)
-__attribute__((aligned(16))) float fft_input[FFT_SIZE * 2];
-__attribute__((aligned(16))) float fft_output[FFT_SIZE];
-float window[FFT_SIZE];
+// FFT buffers (ESP-DSP requires 2*N for complex FFT) - moved to PSRAM
+float* fft_input = nullptr;
+float* fft_output = nullptr;
+float* window = nullptr;
 
-// Mel filterbank
-float melFilterbank[NUM_MEL_FILTERS][FFT_SIZE / 2 + 1];
+// Mel filterbank - moved to PSRAM
+float** melFilterbank = nullptr;
 float mfcc_coeffs[NUM_MFCC];
+
+// MFCC accumulator for calculating mean across all frames
+struct MFCCAccumulator {
+  float sum[NUM_MFCC];
+  uint32_t frameCount;
+  
+  void reset() {
+    for (int i = 0; i < NUM_MFCC; i++) {
+      sum[i] = 0.0;
+    }
+    frameCount = 0;
+  }
+  
+  void addFrame(float* mfcc) {
+    for (int i = 0; i < NUM_MFCC; i++) {
+      sum[i] += mfcc[i];
+    }
+    frameCount++;
+  }
+  
+  void getMean(float* mean) {
+    if (frameCount > 0) {
+      for (int i = 0; i < NUM_MFCC; i++) {
+        mean[i] = sum[i] / frameCount;
+      }
+    } else {
+      for (int i = 0; i < NUM_MFCC; i++) {
+        mean[i] = 0.0;
+      }
+    }
+  }
+};
+
+MFCCAccumulator mfccAccumulator;
 
 // Naive Gaussian Classifier
 struct GaussianClassifier {
@@ -93,6 +131,84 @@ struct WAVHeader {
   char data[4] = {'d', 'a', 't', 'a'};
   uint32_t dataSize;
 };
+
+// ==================== Memory Allocation ====================
+
+bool allocateBuffers() {
+  Serial.println("Allocating buffers in PSRAM...");
+  
+  // Allocate audio buffer (need space for frame + overlap)
+  audioBuffer = (int16_t*)ps_malloc((FRAME_SIZE + FRAME_STRIDE) * sizeof(int16_t));
+  if (!audioBuffer) {
+    Serial.println("Failed to allocate audioBuffer");
+    return false;
+  }
+  memset(audioBuffer, 0, (FRAME_SIZE + FRAME_STRIDE) * sizeof(int16_t));
+  
+  // Allocate FFT buffers
+  fft_input = (float*)ps_malloc(FFT_SIZE * 2 * sizeof(float));
+  if (!fft_input) {
+    Serial.println("Failed to allocate fft_input");
+    return false;
+  }
+  
+  fft_output = (float*)ps_malloc(FFT_SIZE * sizeof(float));
+  if (!fft_output) {
+    Serial.println("Failed to allocate fft_output");
+    return false;
+  }
+  
+  window = (float*)ps_malloc(N_FFT * sizeof(float));  // Window size is N_FFT
+  if (!window) {
+    Serial.println("Failed to allocate window");
+    return false;
+  }
+  
+  // Allocate Mel filterbank (2D array)
+  // Filterbank is based on effective FFT bins
+  int numBins = FFT_SIZE / 2 + 1;
+  
+  melFilterbank = (float**)ps_malloc(NUM_MEL_FILTERS * sizeof(float*));
+  if (!melFilterbank) {
+    Serial.println("Failed to allocate melFilterbank");
+    return false;
+  }
+  
+  for (int i = 0; i < NUM_MEL_FILTERS; i++) {
+    melFilterbank[i] = (float*)ps_malloc(numBins * sizeof(float));
+    if (!melFilterbank[i]) {
+      Serial.println("Failed to allocate melFilterbank row");
+      return false;
+    }
+    memset(melFilterbank[i], 0, numBins * sizeof(float));
+  }
+  
+  Serial.println("All buffers allocated successfully");
+  
+  // Print memory stats
+  Serial.print("Free heap: ");
+  Serial.print(ESP.getFreeHeap());
+  Serial.println(" bytes");
+  Serial.print("Free PSRAM: ");
+  Serial.print(ESP.getFreePsram());
+  Serial.println(" bytes");
+  
+  return true;
+}
+
+void freeBuffers() {
+  if (audioBuffer) free(audioBuffer);
+  if (fft_input) free(fft_input);
+  if (fft_output) free(fft_output);
+  if (window) free(window);
+  
+  if (melFilterbank) {
+    for (int i = 0; i < NUM_MEL_FILTERS; i++) {
+      if (melFilterbank[i]) free(melFilterbank[i]);
+    }
+    free(melFilterbank);
+  }
+}
 
 // ==================== Classifier Functions ====================
 
@@ -157,25 +273,25 @@ void printClassifierModel() {
     Serial.print("  Prior probability: "); Serial.println(classifier.priors[c], 4);
     
     Serial.print("  Means: [");
-    for (int i = 0; i < NUM_MFCC; i++) {
+    for (int i = 0; i < min(5, NUM_MFCC); i++) {
       Serial.print(classifier.means[c][i], 3);
-      if (i < NUM_MFCC - 1) Serial.print(", ");
+      if (i < 4) Serial.print(", ");
     }
-    Serial.println("]");
+    Serial.println("...]");
     
     Serial.print("  Variances: [");
-    for (int i = 0; i < NUM_MFCC; i++) {
+    for (int i = 0; i < min(5, NUM_MFCC); i++) {
       Serial.print(classifier.variances[c][i], 3);
-      if (i < NUM_MFCC - 1) Serial.print(", ");
+      if (i < 4) Serial.print(", ");
     }
-    Serial.println("]");
+    Serial.println("...]");
   }
   Serial.println("========================\n");
 }
 
 // Gaussian probability density function
 float gaussianPDF(float x, float mean, float variance) {
-  if (variance <= 0) variance = 1e-6; // Prevent division by zero
+  if (variance <= 0) variance = 1e-6;
   float exponent = -0.5 * pow((x - mean), 2) / variance;
   float coefficient = 1.0 / sqrt(2.0 * M_PI * variance);
   return coefficient * exp(exponent);
@@ -185,20 +301,15 @@ float gaussianPDF(float x, float mean, float variance) {
 int predictClass(float* mfcc_frame, float* probabilities) {
   float logProbs[NUM_CLASSES];
   
-  // Calculate log probabilities for each class
   for (int c = 0; c < NUM_CLASSES; c++) {
-    // Start with log prior
     logProbs[c] = log(classifier.priors[c] + 1e-10);
     
-    // Add log likelihood for each feature (assuming independence - Naive Bayes)
     for (int i = 0; i < NUM_MFCC; i++) {
       float prob = gaussianPDF(mfcc_frame[i], classifier.means[c][i], classifier.variances[c][i]);
-      // Add small epsilon to avoid log(0)
       logProbs[c] += log(prob + 1e-10);
     }
   }
   
-  // Find class with maximum log probability
   int maxClass = 0;
   float maxLogProb = logProbs[0];
   
@@ -209,9 +320,7 @@ int predictClass(float* mfcc_frame, float* probabilities) {
     }
   }
   
-  // Convert log probabilities to probabilities (optional, for display)
   if (probabilities != NULL) {
-    // Normalize using softmax (subtract max for numerical stability)
     float sumExp = 0.0;
     for (int c = 0; c < NUM_CLASSES; c++) {
       probabilities[c] = exp(logProbs[c] - maxLogProb);
@@ -225,22 +334,19 @@ int predictClass(float* mfcc_frame, float* probabilities) {
   return maxClass;
 }
 
-// Classify all frames in stored MFCC file
+// Classify stored MFCC file using mean of all frames
 void classifyStoredMFCC() {
   if (!classifier.isLoaded) {
     Serial.println("ERROR: Classifier model not loaded!");
-    Serial.println("Please upload the model file first.");
     return;
   }
   
   File f = LittleFS.open(MFCC_FILE_PATH, FILE_READ);
   if (!f) {
     Serial.println("Failed to open MFCC file");
-    Serial.println("Please record audio first.");
     return;
   }
   
-  // Read header
   uint32_t numCoeffs, frameSizeMs, frameStrideMs, sampleRate;
   f.read((uint8_t*)&numCoeffs, sizeof(uint32_t));
   f.read((uint8_t*)&frameSizeMs, sizeof(uint32_t));
@@ -248,40 +354,30 @@ void classifyStoredMFCC() {
   f.read((uint8_t*)&sampleRate, sizeof(uint32_t));
   
   Serial.println("\n=== Classifying Stored MFCC Features ===");
-  Serial.print("MFCC Coefficients: "); Serial.println(numCoeffs);
-  Serial.print("Frame Size: "); Serial.print(frameSizeMs); Serial.println(" ms");
-  Serial.print("Frame Stride: "); Serial.print(frameStrideMs); Serial.println(" ms");
-  Serial.print("Sample Rate: "); Serial.print(sampleRate); Serial.println(" Hz");
+  Serial.print("Frame Size: "); Serial.print(FRAME_SIZE); Serial.print(" samples ("); 
+  Serial.print(frameSizeMs); Serial.println(" ms)");
+  Serial.print("Hop Length: "); Serial.print(FRAME_STRIDE); Serial.print(" samples (");
+  Serial.print(frameStrideMs); Serial.println(" ms)");
+  Serial.print("Frame Overlap: "); Serial.print(FRAME_SIZE - FRAME_STRIDE); Serial.println(" samples");
   Serial.println();
   
-  int classCounts[NUM_CLASSES] = {0};
-  int frameNum = 0;
-  float coeffs[NUM_MFCC];
+  // Accumulate all MFCC frames
+  MFCCAccumulator accumulator;
+  accumulator.reset();
   
-  // Process each frame
+  float coeffs[NUM_MFCC];
+  int frameNum = 0;
+  
+  Serial.println("Reading all frames and computing mean MFCC...");
   while (f.available() >= NUM_MFCC * sizeof(float)) {
     f.read((uint8_t*)coeffs, NUM_MFCC * sizeof(float));
+    accumulator.addFrame(coeffs);
     
-    float probabilities[NUM_CLASSES];
-    int predictedClass = predictClass(coeffs, probabilities);
-    classCounts[predictedClass]++;
-    
-    // Print detailed results for first 10 frames and then every 50th frame
-    if (frameNum < 10 || frameNum % 50 == 0) {
-      Serial.print("Frame "); Serial.print(frameNum);
-      Serial.print(" ["); 
-      Serial.print(frameNum * frameStrideMs);
-      Serial.print(" ms]: ");
-      Serial.print(classifier.classNames[predictedClass]);
-      Serial.print(" (");
-      for (int c = 0; c < NUM_CLASSES; c++) {
-        Serial.print(classifier.classNames[c]);
-        Serial.print("=");
-        Serial.print(probabilities[c] * 100, 1);
-        Serial.print("%");
-        if (c < NUM_CLASSES - 1) Serial.print(", ");
-      }
-      Serial.println(")");
+    // Show progress every 10 frames
+    if (frameNum % 10 == 0) {
+      Serial.print("  Processed ");
+      Serial.print(frameNum);
+      Serial.println(" frames...");
     }
     
     frameNum++;
@@ -289,173 +385,216 @@ void classifyStoredMFCC() {
   
   f.close();
   
-  // Print summary
-  Serial.println("\n=== Classification Summary ===");
-  Serial.print("Total frames analyzed: "); Serial.println(frameNum);
-  Serial.print("Total duration: "); 
-  Serial.print((frameNum * frameStrideMs) / 1000.0, 2);
-  Serial.println(" seconds\n");
+  Serial.print("Total frames read: ");
+  Serial.println(frameNum);
   
-  Serial.println("Class distribution:");
+  if (frameNum == 0) {
+    Serial.println("ERROR: No MFCC frames found!");
+    return;
+  }
+  
+  // Calculate mean MFCC across all frames
+  float meanMFCC[NUM_MFCC];
+  accumulator.getMean(meanMFCC);
+  
+  Serial.println("\nMean MFCC coefficients across all frames:");
+  Serial.print("  [");
+  for (int i = 0; i < NUM_MFCC; i++) {
+    Serial.print(meanMFCC[i], 4);
+    if (i < NUM_MFCC - 1) Serial.print(", ");
+  }
+  Serial.println("]");
+  
+  // Classify using mean MFCC
+  float probabilities[NUM_CLASSES];
+  int predictedClass = predictClass(meanMFCC, probabilities);
+  
+  // Print results
+  Serial.println("\n=== Classification Result ===");
+  Serial.print("Total duration: ");
+  Serial.print((frameNum * frameStrideMs) / 1000.0, 2);
+  Serial.println(" seconds");
+  Serial.print("Number of frames averaged: ");
+  Serial.println(frameNum);
+  Serial.println();
+  
+  Serial.print("Predicted class: ");
+  Serial.println(classifier.classNames[predictedClass]);
+  Serial.print("Confidence: ");
+  Serial.print(probabilities[predictedClass] * 100, 2);
+  Serial.println("%");
+  Serial.println();
+  
+  Serial.println("Class probabilities:");
   for (int c = 0; c < NUM_CLASSES; c++) {
-    float percentage = (float)classCounts[c] / frameNum * 100.0;
-    float duration = (classCounts[c] * frameStrideMs) / 1000.0;
-    
     Serial.print("  ");
     Serial.print(classifier.classNames[c]);
     Serial.print(": ");
-    Serial.print(classCounts[c]);
-    Serial.print(" frames (");
-    Serial.print(percentage, 1);
-    Serial.print("%, ");
-    Serial.print(duration, 2);
-    Serial.println(" sec)");
+    Serial.print(probabilities[c] * 100, 2);
+    Serial.println("%");
   }
-  
-  // Determine overall classification (majority vote)
-  int maxCount = 0;
-  int overallClass = 0;
-  for (int c = 0; c < NUM_CLASSES; c++) {
-    if (classCounts[c] > maxCount) {
-      maxCount = classCounts[c];
-      overallClass = c;
-    }
-  }
-  
-  Serial.print("\nOverall prediction: ");
-  Serial.print(classifier.classNames[overallClass]);
-  Serial.print(" (");
-  Serial.print((float)maxCount / frameNum * 100.0, 1);
-  Serial.println("% of frames)");
   Serial.println("==============================\n");
 }
 
-// ==================== MFCC Functions ====================
+// ==================== MFCC Functions (Librosa-compatible with FFT size limitation) ====================
 
-// Helper function: Convert Hz to Mel scale
+// Hz to Mel conversion (HTK formula - used by librosa by default)
 float hzToMel(float hz) {
   return 2595.0 * log10(1.0 + hz / 700.0);
 }
 
-// Helper function: Convert Mel to Hz scale
+// Mel to Hz conversion
 float melToHz(float mel) {
   return 700.0 * (pow(10.0, mel / 2595.0) - 1.0);
 }
 
-// Initialize Mel filterbank
+// Initialize Mel filterbank (librosa-compatible, scaled for actual FFT size)
 void initMelFilterbank() {
   float melLow = hzToMel(MEL_LOW_FREQ);
   float melHigh = hzToMel(MEL_HIGH_FREQ);
-  float melStep = (melHigh - melLow) / (NUM_MEL_FILTERS + 1);
   
-  // Calculate center frequencies in Mel scale
+  // Create mel points (linearly spaced in mel scale)
   float melPoints[NUM_MEL_FILTERS + 2];
   for (int i = 0; i < NUM_MEL_FILTERS + 2; i++) {
-    melPoints[i] = melLow + i * melStep;
+    melPoints[i] = melLow + (melHigh - melLow) * i / (NUM_MEL_FILTERS + 1);
   }
   
-  // Convert back to Hz and then to FFT bin indices
-  float fftFreqs[FFT_SIZE / 2 + 1];
-  for (int i = 0; i < FFT_SIZE / 2 + 1; i++) {
-    fftFreqs[i] = (float)i * SAMPLE_RATE / FFT_SIZE;
+  // Convert mel points to Hz
+  float hzPoints[NUM_MEL_FILTERS + 2];
+  for (int i = 0; i < NUM_MEL_FILTERS + 2; i++) {
+    hzPoints[i] = melToHz(melPoints[i]);
   }
   
-  // Create triangular filters
+  // Convert Hz to FFT bin indices
+  // Use FFT_SIZE instead of N_FFT to match actual FFT performed
+  int binPoints[NUM_MEL_FILTERS + 2];
+  for (int i = 0; i < NUM_MEL_FILTERS + 2; i++) {
+    binPoints[i] = (int)floor((FFT_SIZE + 1) * hzPoints[i] / SAMPLE_RATE);
+  }
+  
+  int numBins = FFT_SIZE / 2 + 1;
+  
+  // Create triangular filters (librosa style)
   for (int m = 0; m < NUM_MEL_FILTERS; m++) {
-    float leftMel = melPoints[m];
-    float centerMel = melPoints[m + 1];
-    float rightMel = melPoints[m + 2];
+    int leftBin = binPoints[m];
+    int centerBin = binPoints[m + 1];
+    int rightBin = binPoints[m + 2];
     
-    float leftHz = melToHz(leftMel);
-    float centerHz = melToHz(centerMel);
-    float rightHz = melToHz(rightMel);
+    // Initialize all to zero
+    for (int k = 0; k < numBins; k++) {
+      melFilterbank[m][k] = 0.0;
+    }
     
-    for (int k = 0; k < FFT_SIZE / 2 + 1; k++) {
-      float freq = fftFreqs[k];
-      
-      if (freq >= leftHz && freq <= centerHz) {
-        melFilterbank[m][k] = (freq - leftHz) / (centerHz - leftHz);
-      } else if (freq > centerHz && freq <= rightHz) {
-        melFilterbank[m][k] = (rightHz - freq) / (rightHz - centerHz);
-      } else {
-        melFilterbank[m][k] = 0.0;
+    // Left slope
+    for (int k = leftBin; k < centerBin && k < numBins; k++) {
+      if (centerBin != leftBin) {
+        melFilterbank[m][k] = (float)(k - leftBin) / (centerBin - leftBin);
       }
+    }
+    
+    // Right slope
+    for (int k = centerBin; k < rightBin && k < numBins; k++) {
+      if (rightBin != centerBin) {
+        melFilterbank[m][k] = (float)(rightBin - k) / (rightBin - centerBin);
+      }
+    }
+  }
+  
+  // Normalize by mel bandwidth (librosa does this)
+  for (int m = 0; m < NUM_MEL_FILTERS; m++) {
+    float enorm = 2.0 / (hzPoints[m + 2] - hzPoints[m]);
+    for (int k = 0; k < numBins; k++) {
+      melFilterbank[m][k] *= enorm;
     }
   }
 }
 
-// Apply Hamming window
-void applyHammingWindow(int16_t* input, float* output, int length) {
+// Apply Hann window (librosa uses Hann by default)
+void applyHannWindow(int16_t* input, float* output, int length) {
   for (int i = 0; i < length; i++) {
-    output[i] = (float)input[i] * window[i];
+    // Normalize int16 to float [-1.0, 1.0]
+    float normalized = input[i] / 32768.0f;
+    output[i] = normalized * window[i];
   }
 }
 
 // Compute power spectrum using ESP-DSP FFT
+// Since ESP-DSP only supports up to 4096, we'll use the first 4096 samples
 void computePowerSpectrum(float* input, float* output, int length) {
-  // Prepare complex input for FFT (real, imag, real, imag, ...)
   for (int i = 0; i < length; i++) {
-    fft_input[i * 2] = input[i];      // Real part
-    fft_input[i * 2 + 1] = 0.0;       // Imaginary part
+    fft_input[i * 2] = input[i];
+    fft_input[i * 2 + 1] = 0.0;
   }
   
-  // Zero-pad if necessary
   for (int i = length; i < FFT_SIZE; i++) {
     fft_input[i * 2] = 0.0;
     fft_input[i * 2 + 1] = 0.0;
   }
   
-  // Perform FFT using ESP-DSP
   dsps_fft2r_fc32(fft_input, FFT_SIZE);
   dsps_bit_rev_fc32(fft_input, FFT_SIZE);
   
-  // Compute power spectrum: |X[k]|^2
-  for (int i = 0; i < FFT_SIZE / 2 + 1; i++) {
+  int numBins = FFT_SIZE / 2 + 1;
+  for (int i = 0; i < numBins; i++) {
     float real = fft_input[i * 2];
     float imag = fft_input[i * 2 + 1];
-    output[i] = real * real + imag * imag;
+    output[i] = (real * real + imag * imag) / (float)FFT_SIZE;  // Normalize by FFT size
   }
 }
 
-// Apply Mel filterbank and compute log energy
 void applyMelFilters(float* powerSpectrum, float* melEnergies) {
+  int numBins = FFT_SIZE / 2 + 1;
+  
   for (int m = 0; m < NUM_MEL_FILTERS; m++) {
-    float energy = 0.0;
-    for (int k = 0; k < FFT_SIZE / 2 + 1; k++) {
-      energy += powerSpectrum[k] * melFilterbank[m][k];
+    double energy = 0.0;  // Use double for accumulation
+    for (int k = 0; k < numBins; k++) {
+      energy += (double)powerSpectrum[k] * (double)melFilterbank[m][k];
     }
-    // Add small epsilon to avoid log(0)
+    // librosa uses natural log (ln), not log10!
     melEnergies[m] = log(energy + 1e-10);
   }
 }
 
-// Compute DCT (Discrete Cosine Transform) for MFCC
+// Compute DCT Type-II (librosa uses scipy.fftpack.dct with norm='ortho')
 void computeDCT(float* melEnergies, float* mfcc, int numFilters, int numCoeffs) {
   for (int i = 0; i < numCoeffs; i++) {
     float sum = 0.0;
     for (int j = 0; j < numFilters; j++) {
       sum += melEnergies[j] * cos(M_PI * i * (j + 0.5) / numFilters);
     }
-    mfcc[i] = sum;
+    
+    // Apply orthonormal normalization (librosa default)
+    if (i == 0) {
+      mfcc[i] = sum * sqrt(1.0 / numFilters);
+    } else {
+      mfcc[i] = sum * sqrt(2.0 / numFilters);
+    }
   }
 }
 
-// Main MFCC extraction function
+// Main MFCC extraction function (librosa-compatible with FFT limitation workaround)
 void extractMFCC(int16_t* frame) {
-  static float windowedFrame[FFT_SIZE];
-  static float powerSpectrum[FFT_SIZE / 2 + 1];
-  static float melEnergies[NUM_MEL_FILTERS];
+  static float* windowedFrame = nullptr;
+  static float* powerSpectrum = nullptr;
+  static float* melEnergies = nullptr;
   
-  // 1. Apply Hamming window
-  applyHammingWindow(frame, windowedFrame, FRAME_SIZE);
+  // Allocate temporary buffers on first call
+  if (!windowedFrame) {
+    windowedFrame = (float*)ps_malloc(N_FFT * sizeof(float));
+    powerSpectrum = (float*)ps_malloc((FFT_SIZE / 2 + 1) * sizeof(float));
+    melEnergies = (float*)ps_malloc(NUM_MEL_FILTERS * sizeof(float));
+  }
   
-  // 2. Compute power spectrum using ESP-DSP FFT
-  computePowerSpectrum(windowedFrame, powerSpectrum, FRAME_SIZE);
+  // 1. Apply Hann window (librosa default) - apply to full N_FFT samples
+  applyHannWindow(frame, windowedFrame, N_FFT);
+  
+  // 2. Compute power spectrum using ESP-DSP FFT (limited to 4096 samples)
+  computePowerSpectrum(windowedFrame, powerSpectrum, N_FFT);
   
   // 3. Apply Mel filterbank
   applyMelFilters(powerSpectrum, melEnergies);
   
-  // 4. Compute DCT to get MFCC coefficients
+  // 4. Compute DCT to get MFCC coefficients (with orthonormal normalization)
   computeDCT(melEnergies, mfcc_coeffs, NUM_MEL_FILTERS, NUM_MFCC);
   
   // 5. Write MFCC coefficients to file
@@ -464,15 +603,21 @@ void extractMFCC(int16_t* frame) {
     mfccFrameCount++;
   }
   
-  // 6. Optional: Real-time classification during recording
+  // Accumulate for mean calculation during recording
+  if (isRecording) {
+    mfccAccumulator.addFrame(mfcc_coeffs);
+  }
+  
   #if ENABLE_REALTIME_CLASSIFICATION
-  if (classifier.isLoaded && mfccFrameCount % 40 == 0) { // Every ~1 second
+  if (classifier.isLoaded) {
     float probabilities[NUM_CLASSES];
     int predictedClass = predictClass(mfcc_coeffs, probabilities);
     
-    Serial.print("["); Serial.print(mfccFrameCount * FRAME_STRIDE_MS / 1000.0, 1);
-    Serial.print("s] ");
-    Serial.println(classifier.classNames[predictedClass]);
+    float currentTime = (mfccFrameCount * FRAME_STRIDE_MS) / 1000.0;
+    Serial.print("["); Serial.print(currentTime, 2); Serial.print("s] ");
+    Serial.print(classifier.classNames[predictedClass]);
+    Serial.print(" ("); Serial.print(probabilities[predictedClass] * 100, 1);
+    Serial.println("%)");
   }
   #endif
 }
@@ -497,276 +642,6 @@ void listFiles() {
   }
   
   Serial.println("======================\n");
-}
-
-// Add to setup() or call via serial command:
-// listFiles();
-
-// ==================== Main Setup and Loop ====================
-
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  
-  Serial.println("ESP32-S3 INMP441 Recorder with MFCC and Classifier");
-  Serial.println("===================================================");
-  
-  // Initialize button
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  
-  // Initialize LittleFS
-  if (!LittleFS.begin(true)) {
-    Serial.println("LittleFS Mount Failed");
-    return;
-  }
-  Serial.println("LittleFS mounted successfully");
-
-  listFiles();
-  
-  // Initialize ESP-DSP FFT
-  esp_err_t ret = dsps_fft2r_init_fc32(NULL, FFT_SIZE);
-  if (ret != ESP_OK) {
-    Serial.println("Failed to initialize ESP-DSP FFT");
-    return;
-  }
-  Serial.println("ESP-DSP FFT initialized");
-  
-  // Generate Hamming window
-  dsps_wind_hann_f32(window, FFT_SIZE);
-  
-  // Initialize Mel filterbank
-  initMelFilterbank();
-  Serial.println("Mel filterbank initialized");
-  
-  // Load classifier model
-  loadClassifierModel();
-  
-  // Initialize I2S
-  i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = BITS_PER_SAMPLE,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = false,
-    .tx_desc_auto_clear = false,
-    .fixed_mclk = 0
-  };
-  
-  i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SCK,
-    .ws_io_num = I2S_WS,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_SD
-  };
-  
-  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
-    Serial.println("Failed to install I2S driver");
-    return;
-  }
-  
-  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
-    Serial.println("Failed to set I2S pins");
-    return;
-  }
-  
-  Serial.println("I2S initialized successfully");
-  Serial.println("\n=== Commands ===");
-  Serial.println("  Button on GPIO16 - start/stop recording");
-  Serial.println("  'dump'     - dump WAV file to serial");
-  Serial.println("  'mfcc'     - dump MFCC features");
-  Serial.println("  'classify' - classify stored MFCC file");
-  Serial.println("  'model'    - print classifier model");
-  Serial.println("================\n");
-}
-
-void loop() {
-  // Check for serial commands
-  if (Serial.available()) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    
-    if (command == "dump") {
-      dumpWavFile();
-    } else if (command == "mfcc") {
-      dumpMfccFile();
-    } else if (command == "classify") {
-      classifyStoredMFCC();
-    } else if (command == "model") {
-      if (classifier.isLoaded) {
-        printClassifierModel();
-      } else {
-        Serial.println("Classifier model not loaded!");
-      }
-    }
-  }
-  
-  // Check button state (hardware debounced)
-  bool currentButtonState = digitalRead(BUTTON_PIN);
-  
-  if (currentButtonState == LOW && lastButtonState == HIGH) {
-    // Button pressed
-    toggleRecording();
-    delay(50); // Small delay for stability
-  }
-  
-  lastButtonState = currentButtonState;
-  
-  // Record audio if recording is active
-  if (isRecording) {
-    recordAudio();
-  }
-  
-  delay(10);
-}
-
-void toggleRecording() {
-  if (!isRecording) {
-    startRecording();
-  } else {
-    stopRecording();
-  }
-}
-
-void startRecording() {
-  Serial.println("Starting recording...");
-  
-  // Delete existing files if they exist
-  if (LittleFS.exists(WAV_FILE_PATH)) {
-    LittleFS.remove(WAV_FILE_PATH);
-  }
-  if (LittleFS.exists(MFCC_FILE_PATH)) {
-    LittleFS.remove(MFCC_FILE_PATH);
-  }
-  
-  // Open WAV file for writing
-  wavFile = LittleFS.open(WAV_FILE_PATH, FILE_WRITE);
-  if (!wavFile) {
-    Serial.println("Failed to open WAV file for writing");
-    return;
-  }
-  
-  // Open MFCC file for writing
-  mfccFile = LittleFS.open(MFCC_FILE_PATH, FILE_WRITE);
-  if (!mfccFile) {
-    Serial.println("Failed to open MFCC file for writing");
-    wavFile.close();
-    return;
-  }
-  
-  // Write placeholder WAV header (will be updated when recording stops)
-  WAVHeader header;
-  wavFile.write((uint8_t*)&header, WAV_HEADER_SIZE);
-  
-  // Write MFCC file header (metadata) - create temporary variables for #define constants
-  uint32_t numMfcc = NUM_MFCC;
-  uint32_t frameSizeMs = FRAME_SIZE_MS;
-  uint32_t frameStrideMs = FRAME_STRIDE_MS;
-  uint32_t sampleRate = SAMPLE_RATE;
-  
-  mfccFile.write((uint8_t*)&numMfcc, sizeof(uint32_t));
-  mfccFile.write((uint8_t*)&frameSizeMs, sizeof(uint32_t));
-  mfccFile.write((uint8_t*)&frameStrideMs, sizeof(uint32_t));
-  mfccFile.write((uint8_t*)&sampleRate, sizeof(uint32_t));
-  
-  recordedSamples = 0;
-  mfccFrameCount = 0;
-  bufferIndex = 0;
-  memset(audioBuffer, 0, sizeof(audioBuffer));
-  
-  isRecording = true;
-  Serial.println("Recording started");
-}
-
-void stopRecording() {
-  Serial.println("Stopping recording...");
-  isRecording = false;
-  
-  if (!wavFile) {
-    Serial.println("No active recording");
-    return;
-  }
-  
-  // Update WAV header with actual sizes
-  updateWavHeader();
-  
-  wavFile.close();
-  mfccFile.close();
-  
-  Serial.print("Recording stopped. Samples recorded: ");
-  Serial.println(recordedSamples);
-  Serial.print("MFCC frames computed: ");
-  Serial.println(mfccFrameCount);
-  
-  // Print file sizes
-  File f = LittleFS.open(WAV_FILE_PATH, FILE_READ);
-  if (f) {
-    Serial.print("WAV file size: ");
-    Serial.print(f.size());
-    Serial.println(" bytes");
-    f.close();
-  }
-  
-  f = LittleFS.open(MFCC_FILE_PATH, FILE_READ);
-  if (f) {
-    Serial.print("MFCC file size: ");
-    Serial.print(f.size());
-    Serial.println(" bytes");
-    f.close();
-  }
-  
-  Serial.println("\nType 'classify' to classify the recording");
-}
-
-void recordAudio() {
-  int32_t i2s_buffer[I2S_READ_LEN];
-  size_t bytes_read = 0;
-  
-  // Read from I2S
-  esp_err_t result = i2s_read(I2S_PORT, i2s_buffer, I2S_READ_LEN * sizeof(int32_t), &bytes_read, portMAX_DELAY);
-  
-  if (result == ESP_OK && bytes_read > 0) {
-    int samples_read = bytes_read / sizeof(int32_t);
-    
-    // Convert 32-bit samples to 16-bit and write to file
-    for (int i = 0; i < samples_read; i++) {
-      // INMP441 outputs 24-bit data in 32-bit container, shift right to get 16-bit
-      int16_t sample = (i2s_buffer[i] >> 14) & 0xFFFF;
-      wavFile.write((uint8_t*)&sample, sizeof(int16_t));
-      recordedSamples++;
-      
-      // Add sample to sliding window buffer
-      audioBuffer[bufferIndex] = sample;
-      bufferIndex++;
-      
-      // When we have enough samples for a frame, extract MFCC
-      if (bufferIndex >= FRAME_SIZE) {
-        extractMFCC(audioBuffer);
-        
-        // Shift buffer by FRAME_STRIDE samples (overlap)
-        memmove(audioBuffer, audioBuffer + FRAME_STRIDE, 
-                (FRAME_SIZE - FRAME_STRIDE) * sizeof(int16_t));
-        bufferIndex = FRAME_SIZE - FRAME_STRIDE;
-      }
-    }
-  }
-}
-
-void updateWavHeader() {
-  WAVHeader header;
-  
-  uint32_t dataSize = recordedSamples * sizeof(int16_t);
-  header.dataSize = dataSize;
-  header.fileSize = dataSize + WAV_HEADER_SIZE - 8;
-  header.byteRate = SAMPLE_RATE * sizeof(int16_t);
-  header.blockAlign = sizeof(int16_t);
-  
-  // Seek to beginning and write updated header
-  wavFile.seek(0);
-  wavFile.write((uint8_t*)&header, WAV_HEADER_SIZE);
 }
 
 void dumpWavFile() {
@@ -802,16 +677,32 @@ void dumpMfccFile() {
   
   Serial.println("\n=== MFCC FILE DUMP ===");
   Serial.print("Num Coefficients: "); Serial.println(numCoeffs);
-  Serial.print("Frame Size (ms): "); Serial.println(frameSizeMs);
-  Serial.print("Frame Stride (ms): "); Serial.println(frameStrideMs);
+  Serial.print("Frame Size: "); Serial.print(FRAME_SIZE); Serial.print(" samples (");
+  Serial.print(frameSizeMs); Serial.println(" ms)");
+  Serial.print("Hop Length: "); Serial.print(FRAME_STRIDE); Serial.print(" samples (");
+  Serial.print(frameStrideMs); Serial.println(" ms)");
   Serial.print("Sample Rate: "); Serial.println(sampleRate);
+  Serial.println("\nLibrosa-compatible parameters:");
+  Serial.print("  n_mfcc: "); Serial.println(NUM_MFCC);
+  Serial.print("  n_fft (requested): "); Serial.println(N_FFT);
+  Serial.print("  FFT size (actual): "); Serial.println(FFT_SIZE);
+  Serial.print("  hop_length: "); Serial.println(HOP_LENGTH);
+  Serial.print("  n_mels: "); Serial.println(NUM_MEL_FILTERS);
+  Serial.println("  Note: Using first 4096 samples due to ESP-DSP limitation");
   Serial.println("\nMFCC Coefficients (frame by frame):");
+  
+  // Accumulator to calculate mean while reading
+  MFCCAccumulator accumulator;
+  accumulator.reset();
   
   int frameNum = 0;
   float coeffs[NUM_MFCC];
   
   while (f.available() >= NUM_MFCC * sizeof(float)) {
     f.read((uint8_t*)coeffs, NUM_MFCC * sizeof(float));
+    
+    // Add to accumulator for mean calculation
+    accumulator.addFrame(coeffs);
     
     Serial.print("Frame "); Serial.print(frameNum); Serial.print(": ");
     for (int i = 0; i < NUM_MFCC; i++) {
@@ -822,6 +713,337 @@ void dumpMfccFile() {
     frameNum++;
   }
   
-  Serial.println("=== END DUMP ===\n");
   f.close();
+  
+  // Calculate and display mean MFCC
+  if (frameNum > 0) {
+    float meanMFCC[NUM_MFCC];
+    accumulator.getMean(meanMFCC);
+    
+    Serial.println("\n--- AVERAGED MFCC ---");
+    Serial.print("Mean over ");
+    Serial.print(frameNum);
+    Serial.println(" frames:");
+    Serial.print("  [");
+    for (int i = 0; i < NUM_MFCC; i++) {
+      Serial.print(meanMFCC[i], 4);
+      if (i < NUM_MFCC - 1) Serial.print(", ");
+    }
+    Serial.println("]");
+    Serial.println("---------------------");
+  }
+  
+  Serial.println("\n=== END DUMP ===\n");
+}
+
+// ==================== Main Setup and Loop ====================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("ESP32-S3 INMP441 Recorder with MFCC and Classifier");
+  Serial.println("===================================================");
+  Serial.println("Librosa-approximated MFCC extraction:");
+  Serial.print("  n_mfcc="); Serial.println(NUM_MFCC);
+  Serial.print("  n_fft (requested)="); Serial.println(N_FFT);
+  Serial.print("  FFT size (actual)="); Serial.println(FFT_SIZE);
+  Serial.print("  hop_length="); Serial.println(HOP_LENGTH);
+  Serial.print("  n_mels="); Serial.println(NUM_MEL_FILTERS);
+  Serial.println("  * Note: ESP-DSP limited to 4096 FFT size");
+  Serial.println("  * Using first 4096 of 10000 samples");
+  Serial.println("Classification method: Mean of all MFCC frames");
+  
+  // Check PSRAM
+  if (!psramFound()) {
+    Serial.println("ERROR: PSRAM not found!");
+    Serial.println("Please enable PSRAM in Tools > PSRAM");
+    while(1) delay(1000);
+  }
+  
+  Serial.print("PSRAM size: ");
+  Serial.print(ESP.getPsramSize() / 1024);
+  Serial.println(" KB");
+  
+  // Allocate buffers
+  if (!allocateBuffers()) {
+    Serial.println("ERROR: Failed to allocate buffers!");
+    while(1) delay(1000);
+  }
+  
+  Serial.print("Frame size: "); Serial.print(FRAME_SIZE); 
+  Serial.print(" samples (~"); Serial.print(FRAME_SIZE_MS); Serial.println(" ms)");
+  Serial.print("Hop length: "); Serial.print(FRAME_STRIDE); 
+  Serial.print(" samples ("); Serial.print(FRAME_STRIDE_MS); Serial.println(" ms)");
+  Serial.print("Overlap: "); Serial.print(FRAME_SIZE - FRAME_STRIDE); Serial.println(" samples");
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS Mount Failed");
+    return;
+  }
+  Serial.println("LittleFS mounted successfully");
+
+  listFiles();
+  
+  esp_err_t ret = dsps_fft2r_init_fc32(NULL, FFT_SIZE);
+  if (ret != ESP_OK) {
+    Serial.println("Failed to initialize ESP-DSP FFT");
+    return;
+  }
+  Serial.println("ESP-DSP FFT initialized (4096 point)");
+  
+  // Generate Hann window for the full N_FFT size
+  dsps_wind_hann_f32(window, N_FFT);
+  
+  initMelFilterbank();
+  Serial.println("Mel filterbank initialized");
+  
+  // Initialize MFCC accumulator
+  mfccAccumulator.reset();
+  
+  loadClassifierModel();
+  
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = BITS_PER_SAMPLE,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
+  
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_SD
+  };
+  
+  if (i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL) != ESP_OK) {
+    Serial.println("Failed to install I2S driver");
+    return;
+  }
+  
+  if (i2s_set_pin(I2S_PORT, &pin_config) != ESP_OK) {
+    Serial.println("Failed to set I2S pins");
+    return;
+  }
+  
+  Serial.println("I2S initialized successfully");
+  Serial.println("\n=== Commands ===");
+  Serial.println("  Button on GPIO16 - start/stop recording");
+  Serial.println("  'dump'     - dump WAV file to serial");
+  Serial.println("  'mfcc'     - dump MFCC features + averaged MFCC");
+  Serial.println("  'classify' - classify using mean MFCC");
+  Serial.println("  'model'    - print classifier model");
+  Serial.println("================\n");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "dump") {
+      dumpWavFile();
+    } else if (command == "mfcc") {
+      dumpMfccFile();
+    } else if (command == "classify") {
+      classifyStoredMFCC();
+    } else if (command == "model") {
+      if (classifier.isLoaded) {
+        printClassifierModel();
+      } else {
+        Serial.println("Classifier model not loaded!");
+      }
+    }
+  }
+  
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  
+  if (currentButtonState == LOW && lastButtonState == HIGH) {
+    toggleRecording();
+    delay(50);
+  }
+  
+  lastButtonState = currentButtonState;
+  
+  if (isRecording) {
+    recordAudio();
+  }
+  
+  delay(10);
+}
+
+void toggleRecording() {
+  if (!isRecording) {
+    startRecording();
+  } else {
+    stopRecording();
+  }
+}
+
+void startRecording() {
+  Serial.println("Starting recording...");
+  
+  if (LittleFS.exists(WAV_FILE_PATH)) LittleFS.remove(WAV_FILE_PATH);
+  if (LittleFS.exists(MFCC_FILE_PATH)) LittleFS.remove(MFCC_FILE_PATH);
+  
+  wavFile = LittleFS.open(WAV_FILE_PATH, FILE_WRITE);
+  if (!wavFile) {
+    Serial.println("Failed to open WAV file");
+    return;
+  }
+  
+  mfccFile = LittleFS.open(MFCC_FILE_PATH, FILE_WRITE);
+  if (!mfccFile) {
+    Serial.println("Failed to open MFCC file");
+    wavFile.close();
+    return;
+  }
+  
+  WAVHeader header;
+  wavFile.write((uint8_t*)&header, WAV_HEADER_SIZE);
+  
+  uint32_t numMfcc = NUM_MFCC;
+  uint32_t frameSizeMs = FRAME_SIZE_MS;
+  uint32_t frameStrideMs = FRAME_STRIDE_MS;
+  uint32_t sampleRate = SAMPLE_RATE;
+  
+  mfccFile.write((uint8_t*)&numMfcc, sizeof(uint32_t));
+  mfccFile.write((uint8_t*)&frameSizeMs, sizeof(uint32_t));
+  mfccFile.write((uint8_t*)&frameStrideMs, sizeof(uint32_t));
+  mfccFile.write((uint8_t*)&sampleRate, sizeof(uint32_t));
+  
+  recordedSamples = 0;
+  mfccFrameCount = 0;
+  bufferIndex = 0;
+  memset(audioBuffer, 0, (FRAME_SIZE + FRAME_STRIDE) * sizeof(int16_t));
+  
+  // Reset MFCC accumulator for this recording
+  mfccAccumulator.reset();
+  
+  isRecording = true;
+  Serial.println("Recording started");
+  Serial.println("(Using 4096-point FFT approximation of 10000-point)");
+}
+
+void stopRecording() {
+  Serial.println("Stopping recording...");
+  isRecording = false;
+  
+  if (!wavFile) {
+    Serial.println("No active recording");
+    return;
+  }
+  
+  updateWavHeader();
+  wavFile.close();
+  mfccFile.close();
+  
+  Serial.print("Recording stopped. Samples recorded: ");
+  Serial.println(recordedSamples);
+  Serial.print("MFCC frames computed: ");
+  Serial.println(mfccFrameCount);
+  Serial.print("Duration: ");
+  Serial.print(recordedSamples / (float)SAMPLE_RATE, 2);
+  Serial.println(" seconds");
+  
+  // Print file sizes
+  File f = LittleFS.open(WAV_FILE_PATH, FILE_READ);
+  if (f) {
+    Serial.print("WAV file size: ");
+    Serial.print(f.size());
+    Serial.println(" bytes");
+    f.close();
+  }
+  
+  f = LittleFS.open(MFCC_FILE_PATH, FILE_READ);
+  if (f) {
+    Serial.print("MFCC file size: ");
+    Serial.print(f.size());
+    Serial.println(" bytes");
+    f.close();
+  }
+  
+  // Auto-classify if classifier is loaded
+  if (classifier.isLoaded && mfccAccumulator.frameCount > 0) {
+    Serial.println("\n--- Auto-classifying recording ---");
+    
+    float meanMFCC[NUM_MFCC];
+    mfccAccumulator.getMean(meanMFCC);
+    
+    Serial.print("Computed mean over ");
+    Serial.print(mfccAccumulator.frameCount);
+    Serial.println(" frames");
+    
+    float probabilities[NUM_CLASSES];
+    int predictedClass = predictClass(meanMFCC, probabilities);
+    
+    Serial.print("\nPredicted: ");
+    Serial.print(classifier.classNames[predictedClass]);
+    Serial.print(" (");
+    Serial.print(probabilities[predictedClass] * 100, 1);
+    Serial.println("%)");
+    
+    Serial.println("All probabilities:");
+    for (int c = 0; c < NUM_CLASSES; c++) {
+      Serial.print("  ");
+      Serial.print(classifier.classNames[c]);
+      Serial.print(": ");
+      Serial.print(probabilities[c] * 100, 1);
+      Serial.println("%");
+    }
+  }
+  
+  Serial.println("\nType 'classify' for detailed classification");
+  Serial.println("Type 'mfcc' to see all frames + averaged MFCC");
+}
+
+void recordAudio() {
+  int32_t i2s_buffer[I2S_READ_LEN];
+  size_t bytes_read = 0;
+  
+  esp_err_t result = i2s_read(I2S_PORT, i2s_buffer, I2S_READ_LEN * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+  
+  if (result == ESP_OK && bytes_read > 0) {
+    int samples_read = bytes_read / sizeof(int32_t);
+    
+    for (int i = 0; i < samples_read; i++) {
+      int16_t sample = (i2s_buffer[i] >> 14) & 0xFFFF;
+      wavFile.write((uint8_t*)&sample, sizeof(int16_t));
+      recordedSamples++;
+      
+      audioBuffer[bufferIndex] = sample;
+      bufferIndex++;
+      
+      if (bufferIndex >= FRAME_SIZE) {
+        extractMFCC(audioBuffer);
+        
+        memmove(audioBuffer, audioBuffer + FRAME_STRIDE, 
+                (FRAME_SIZE - FRAME_STRIDE) * sizeof(int16_t));
+        bufferIndex = FRAME_SIZE - FRAME_STRIDE;
+      }
+    }
+  }
+}
+
+void updateWavHeader() {
+  WAVHeader header;
+  
+  uint32_t dataSize = recordedSamples * sizeof(int16_t);
+  header.dataSize = dataSize;
+  header.fileSize = dataSize + WAV_HEADER_SIZE - 8;
+  header.byteRate = SAMPLE_RATE * sizeof(int16_t);
+  header.blockAlign = sizeof(int16_t);
+  
+  wavFile.seek(0);
+  wavFile.write((uint8_t*)&header, WAV_HEADER_SIZE);
 }
